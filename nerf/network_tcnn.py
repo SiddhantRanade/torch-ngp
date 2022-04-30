@@ -1,26 +1,26 @@
+import numpy as np
+import tinycudann as tcnn
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-import numpy as np
-
-import tinycudann as tcnn
 from activation import trunc_exp
+
 from .renderer import NeRFRenderer
 
 
 class NeRFNetwork(NeRFRenderer):
-    def __init__(self,
-                 encoding="HashGrid",
-                 encoding_dir="SphericalHarmonics",
-                 num_layers=2,
-                 hidden_dim=64,
-                 geo_feat_dim=15,
-                 num_layers_color=3,
-                 hidden_dim_color=64,
-                 bound=1,
-                 **kwargs
-                 ):
+    def __init__(
+        self,
+        encoding="HashGrid",
+        encoding_dir="SphericalHarmonics",
+        num_layers=2,
+        hidden_dim=64,
+        geo_feat_dim=15,
+        num_layers_color=3,
+        hidden_dim_color=64,
+        bound=1,
+        **kwargs
+    ):
         super().__init__(bound, **kwargs)
 
         # sigma network
@@ -55,15 +55,12 @@ class NeRFNetwork(NeRFRenderer):
         )
 
         # color network
-        self.num_layers_color = num_layers_color        
+        self.num_layers_color = num_layers_color
         self.hidden_dim_color = hidden_dim_color
 
         self.encoder_dir = tcnn.Encoding(
             n_input_dims=3,
-            encoding_config={
-                "otype": "SphericalHarmonics",
-                "degree": 4,
-            },
+            encoding_config={"otype": "SphericalHarmonics", "degree": 4,},
         )
 
         self.in_dim_color = self.encoder_dir.n_output_dims + self.geo_feat_dim
@@ -80,29 +77,27 @@ class NeRFNetwork(NeRFRenderer):
             },
         )
 
-    
     def forward(self, x, d):
         # x: [N, 3], in [-bound, bound]
         # d: [N, 3], nomalized in [-1, 1]
 
-
         # sigma
-        x = (x + self.bound) / (2 * self.bound) # to [0, 1]
+        x = (x + self.bound) / (2 * self.bound)  # to [0, 1]
         x = self.encoder(x)
         h = self.sigma_net(x)
 
-        #sigma = F.relu(h[..., 0])
+        # sigma = F.relu(h[..., 0])
         sigma = trunc_exp(h[..., 0])
         geo_feat = h[..., 1:]
 
         # color
-        d = (d + 1) / 2 # tcnn SH encoding requires inputs to be in [0, 1]
+        d = (d + 1) / 2  # tcnn SH encoding requires inputs to be in [0, 1]
         d = self.encoder_dir(d)
 
-        #p = torch.zeros_like(geo_feat[..., :1]) # manual input padding
+        # p = torch.zeros_like(geo_feat[..., :1]) # manual input padding
         h = torch.cat([d, geo_feat], dim=-1)
         h = self.color_net(h)
-        
+
         # sigmoid activation for rgb
         color = torch.sigmoid(h)
 
@@ -111,17 +106,17 @@ class NeRFNetwork(NeRFRenderer):
     def density(self, x):
         # x: [N, 3], in [-bound, bound]
 
-        x = (x + self.bound) / (2 * self.bound) # to [0, 1]
+        x = (x + self.bound) / (2 * self.bound)  # to [0, 1]
         x = self.encoder(x)
         h = self.sigma_net(x)
 
-        #sigma = F.relu(h[..., 0])
+        # sigma = F.relu(h[..., 0])
         sigma = trunc_exp(h[..., 0])
         geo_feat = h[..., 1:]
 
         return {
-            'sigma': sigma,
-            'geo_feat': geo_feat,
+            "sigma": sigma,
+            "geo_feat": geo_feat,
         }
 
     # allow masked inference
@@ -129,10 +124,12 @@ class NeRFNetwork(NeRFRenderer):
         # x: [N, 3] in [-bound, bound]
         # mask: [N,], bool, indicates where we actually needs to compute rgb.
 
-        x = (x + self.bound) / (2 * self.bound) # to [0, 1]
+        x = (x + self.bound) / (2 * self.bound)  # to [0, 1]
 
         if mask is not None:
-            rgbs = torch.zeros(mask.shape[0], 3, dtype=x.dtype, device=x.device) # [N, 3]
+            rgbs = torch.zeros(
+                mask.shape[0], 3, dtype=x.dtype, device=x.device
+            )  # [N, 3]
             # in case of empty mask
             if not mask.any():
                 return rgbs
@@ -141,18 +138,18 @@ class NeRFNetwork(NeRFRenderer):
             geo_feat = geo_feat[mask]
 
         # color
-        d = (d + 1) / 2 # tcnn SH encoding requires inputs to be in [0, 1]
+        d = (d + 1) / 2  # tcnn SH encoding requires inputs to be in [0, 1]
         d = self.encoder_dir(d)
 
         h = torch.cat([d, geo_feat], dim=-1)
         h = self.color_net(h)
-        
+
         # sigmoid activation for rgb
         h = torch.sigmoid(h)
 
         if mask is not None:
-            rgbs[mask] = h.to(rgbs.dtype) # fp16 --> fp32
+            rgbs[mask] = h.to(rgbs.dtype)  # fp16 --> fp32
         else:
             rgbs = h
 
-        return rgbs        
+        return rgbs
