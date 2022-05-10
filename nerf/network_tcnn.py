@@ -19,6 +19,7 @@ class NeRFNetwork(NeRFRenderer):
         num_layers_color=3,
         hidden_dim_color=64,
         bound=1,
+        reg_weight=0,
         **kwargs
     ):
         super().__init__(bound, **kwargs)
@@ -76,6 +77,8 @@ class NeRFNetwork(NeRFRenderer):
                 "n_hidden_layers": num_layers_color - 1,
             },
         )
+
+        self.reg_weight = reg_weight
 
     def forward(self, x, d):
         # x: [N, 3], in [-bound, bound]

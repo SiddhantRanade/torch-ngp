@@ -112,7 +112,7 @@ class NeRFGUI:
         dpg.set_value("_log_train_time", f"{t:.4f}ms")
         dpg.set_value(
             "_log_train_log",
-            f'step = {self.step: 5d} (+{self.train_steps: 2d}), loss = {outputs["loss"]:.4f}, lr = {outputs["lr"]:.5f}',
+            f'step = {self.step: 5d} (+{self.train_steps: 2d}), loss = {outputs["loss"]:.4f}, reg = {outputs["reg"]:.4f}, lr = {outputs["lr"]:.5f}',
         )
 
         # dynamic train steps

@@ -1,16 +1,47 @@
 import glob
 import json
 import os
+import os.path as osp
 
 import cv2
 import numpy as np
 import torch
 import tqdm
 import trimesh
+from hawp.graph import WireframeGraph
+from hawp.predicting import WireframeParser
 from scipy.spatial.transform import Rotation, Slerp
 from torch.utils.data import DataLoader
 
-from .utils import get_rays
+from .utils import get_rays, get_rays_for_lines
+
+
+def extract_or_load_lines(img_path):
+    # if "wfp" not in extract_or_load_lines.__dict__:
+    if not hasattr(extract_or_load_lines, "wfp"):
+        extract_or_load_lines.wfp = WireframeParser()
+
+    lines_path = img_path + ".wireframe.json"
+    if not osp.exists(lines_path):
+        wfg, _, meta = next(extract_or_load_lines.wfp.images([img_path]))
+
+        wfg_json = wfg.jsonize()
+        with open(lines_path, "w") as writer:
+            json.dump(wfg_json, writer)
+    else:
+        with open(lines_path) as fp:
+            wfg_json = json.load(fp)
+        # TODO: device
+        wfg = WireframeGraph(
+            vertices=torch.tensor(wfg_json["vertices"]),
+            v_confidences=torch.tensor(wfg_json["vertices-score"]),
+            edges=torch.tensor(wfg_json["edges"]),
+            edge_weights=torch.tensor(wfg_json["edges-weights"]),
+            frame_width=wfg_json["width"],
+            frame_height=wfg_json["height"],
+        )
+
+    return wfg
 
 
 # ref: https://github.com/NVlabs/instant-ngp/blob/b76004c8cf478880227401ae763be4c02f80b62f/include/neural-graphics-primitives/nerf_loader.h#L50
@@ -203,6 +234,7 @@ class NeRFDataset:
 
             self.poses = []
             self.images = []
+            self.lines = []
             for f in tqdm.tqdm(frames, desc=f"Loading {type} data:"):
                 f_path = os.path.join(self.root_path, f["file_path"])
                 if self.mode == "blender" and f_path[-4:] != ".png":
@@ -222,6 +254,12 @@ class NeRFDataset:
                     self.H = image.shape[0] // downscale
                     self.W = image.shape[1] // downscale
 
+                wfg = extract_or_load_lines(f_path)  # wireframegraph
+                # remove the confidence and downscale
+                # TODO: threshold in config
+                lines = wfg.line_segments(threshold=0.8)[:, :4] / downscale
+                lines = lines.cuda()
+
                 # add support for the alpha channel as a mask.
                 if image.shape[-1] == 3:
                     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -235,6 +273,7 @@ class NeRFDataset:
 
                 self.poses.append(pose)
                 self.images.append(image)
+                self.lines.append(lines)
 
         self.poses = torch.from_numpy(np.stack(self.poses, axis=0))  # [N, 4, 4]
         if self.images is not None:
@@ -327,6 +366,19 @@ class NeRFDataset:
             }
 
         poses = self.poses[index].to(self.device)  # [B, 4, 4]
+        N_points_per_line = 20
+        N_lines_per_image = 30
+        lines = []
+        for idx in index:
+            # TODO: get more lines
+            lines.append(
+                self.lines[idx][:N_lines_per_image]
+            )  # Get the first 10 lines from all frames
+        lines = torch.stack(lines, 0)  # [B, N_lines, 4]
+
+        rays_l = get_rays_for_lines(
+            poses, self.intrinsics, lines, self.H, self.W, N_points_per_line,
+        )  # 20 points per line
 
         error_map = None if self.error_map is None else self.error_map[index]
 
@@ -339,6 +391,9 @@ class NeRFDataset:
             "W": self.W,
             "rays_o": rays["rays_o"],
             "rays_d": rays["rays_d"],
+            "lines": lines,
+            "rays_o_l": rays_l["rays_o"],
+            "rays_d_l": rays_l["rays_d"],
         }
 
         if self.images is not None:

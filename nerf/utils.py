@@ -19,6 +19,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import tqdm
 import trimesh
+from matplotlib import cm
 from packaging import version as pver
 from rich.console import Console
 from torch.utils.data import DataLoader, Dataset
@@ -31,6 +32,54 @@ def custom_meshgrid(*args):
         return torch.meshgrid(*args)
     else:
         return torch.meshgrid(*args, indexing="ij")
+
+
+@torch.cuda.amp.autocast(enabled=False)
+def get_rays_for_lines(poses, intrinsics, lines, H, W, N=20):
+    """ get rays
+    Args:
+        poses: [B, 4, 4], cam2world
+        intrinsics: [4]
+        lines: [B, M, 4]
+        H, W: int
+        M:  lines per image
+        N: number of points to sample on each line
+    Returns:
+        rays_o, rays_d: [B, N, 3]
+        inds: [B, N]
+    """
+
+    device = poses.device
+    B = poses.shape[0]
+    M = lines.shape[1]
+    fx, fy, cx, cy = intrinsics
+
+    ij = torch.lerp(
+        lines[:, :, :2, None],
+        lines[:, :, 2:, None],
+        torch.linspace(0, 1, N, device=device)[:],
+    )  # [B, M, 2, N]
+    i, j = ij[:, :, 0, :], ij[:, :, 1, :]  # [B, M, N]
+
+    results = {}
+
+    zs = torch.ones_like(i)  # [B, M, N]
+    xs = (i - cx) / fx * zs
+    ys = (j - cy) / fy * zs
+    directions = torch.stack((xs, ys, zs), dim=-1)  # [B, M, N, 3]
+    directions = directions / torch.norm(directions, dim=-1, keepdim=True)
+    # rays_d = directions @ poses[:, :3, :3].transpose(-1, -2)  # (B, N, 3)
+    rays_d = directions @ poses[:, None, :3, :3].transpose(-1, -2)  # (B, M, N, 3)
+
+    rays_d = rays_d.view((B, M * N, 3))
+
+    rays_o = poses[..., :3, 3]  # [B, 3]
+    rays_o = rays_o[..., None, :].expand_as(rays_d)  # [B, M * N, 3]
+
+    results["rays_o"] = rays_o
+    results["rays_d"] = rays_d
+
+    return results
 
 
 @torch.cuda.amp.autocast(enabled=False)
@@ -274,6 +323,7 @@ class Trainer(object):
         use_checkpoint="latest",  # which ckpt to use at init time
         use_tensorboardX=True,  # whether to use tensorboard for logging
         scheduler_update_every_step=False,  # whether to call scheduler.step() after every train step
+        density_regularizer=None,  # regularizer, if None, assume inline implementation in train_step
     ):
 
         self.name = name
@@ -314,6 +364,7 @@ class Trainer(object):
         if isinstance(criterion, nn.Module):
             criterion.to(self.device)
         self.criterion = criterion
+        self.density_regularizer = density_regularizer
 
         if optimizer is None:
             self.optimizer = optim.Adam(
@@ -344,6 +395,7 @@ class Trainer(object):
         self.local_step = 0
         self.stats = {
             "loss": [],
+            "reg": [],
             "valid_loss": [],
             "results": [],  # metrics[0], or valid_loss
             "checkpoints": [],  # record path of saved ckpt, to automatically remove old ckpt
@@ -436,7 +488,7 @@ class Trainer(object):
                 perturb=True,
                 force_all_rays=True,
                 **vars(self.opt),
-            )
+            )  # type: ignore
             pred_rgb = (
                 outputs["image"].reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous()
             )
@@ -446,7 +498,11 @@ class Trainer(object):
 
             loss = self.clip_loss(pred_rgb)
 
-            return pred_rgb, None, loss
+            alphas = outputs["alphas"]
+            # reg = self.density_regularizer(alphas)
+            reg = 0
+
+            return pred_rgb, None, loss, reg
 
         images = data["images"]  # [B, N, 3/4]
 
@@ -472,7 +528,7 @@ class Trainer(object):
             bg_color=bg_color,
             perturb=True,
             **vars(self.opt),
-        )
+        )  # type: ignore
 
         pred_rgb = outputs["image"]
 
@@ -504,7 +560,42 @@ class Trainer(object):
 
         loss = loss.mean()
 
-        return pred_rgb, gt_rgb, loss
+        lines = data["lines"]  # [B, M, 4]
+        rays_o_l = data["rays_o_l"]  # [B, M * N_l, 3]
+        rays_d_l = data["rays_d_l"]  # [B, M * N_l, 3]
+        # import ipdb
+
+        # ipdb.set_trace()
+        outputs_l = self.model.render(
+            rays_o_l,
+            rays_d_l,
+            staged=True,
+            bg_color=None,  # TODO: bg_color for lines?
+            perturb=False,
+            **vars(self.opt),
+        )
+
+        depth_l = outputs_l["depth_unnorm"]  # [B, M * N_l]
+        xyz_l = rays_o_l + rays_d_l * depth_l[..., None]  # [B, M * N_l, 3]
+        xyz_l = xyz_l.view(B, lines.shape[1], -1, 3)  # [B, M, N_l, 3]
+
+        # TODO: MAIN: Add loss function
+        # Points p1, p2, p3, ..., pM
+        # Idea 1: M-gon inequality (triangle inequality)
+        # Sum of consecutive distances >= distance (p1 to pM)
+        # Indirect dist >= direct dist
+        # Minimize: (Indirect - direct) / direct
+        indirect = (
+            (xyz_l[:, :, :-1, :] - xyz_l[:, :, 1:, :]).norm(p=2, dim=-1).sum(dim=-1)
+        )
+        direct = (xyz_l[:, :, 0, :] - xyz_l[:, :, -1, :]).norm(p=2, dim=-1)
+
+        reg = (indirect - direct).mean()
+        # Collinearity
+
+        # reg = self.density_regularizer(depth_l)
+
+        return pred_rgb, gt_rgb, loss, reg
 
     def eval_step(self, data):
 
@@ -536,7 +627,19 @@ class Trainer(object):
 
         loss = self.criterion(pred_rgb, gt_rgb).mean()
 
-        return pred_rgb, pred_depth, gt_rgb, loss
+        lines = data["lines"]  # [B, M, 4]
+        rays_o_l = data["rays_o_l"]  # [B, M * N_l, 3]
+        rays_d_l = data["rays_d_l"]  # [B, M * N_l, 3]
+        outputs_l = self.model.render(
+            rays_o_l,
+            rays_d_l,
+            staged=True,
+            bg_color=bg_color,
+            perturb=False,
+            **vars(self.opt),
+        )
+
+        return pred_rgb, pred_depth, gt_rgb, loss, lines, outputs_l
 
     # moved out bg_color and perturb for more flexible control...
     def test_step(self, data, bg_color=None, perturb=False):
@@ -684,6 +787,7 @@ class Trainer(object):
         self.model.train()
 
         total_loss = torch.tensor([0], dtype=torch.float32, device=self.device)
+        total_reg = torch.tensor([0], dtype=torch.float32, device=self.device)
 
         loader = iter(train_loader)
 
@@ -713,9 +817,9 @@ class Trainer(object):
             self.optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data)
+                preds, truths, loss, reg = self.train_step(data)
 
-            self.scaler.scale(loss).backward()
+            self.scaler.scale(loss + reg).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
@@ -723,11 +827,13 @@ class Trainer(object):
                 self.lr_scheduler.step()
 
             total_loss += loss.detach()
+            total_reg += reg.detach()
 
         if self.ema is not None:
             self.ema.update()
 
         average_loss = total_loss.item() / step
+        average_reg = total_reg.item() / step
 
         if not self.scheduler_update_every_step:
             if isinstance(
@@ -739,6 +845,7 @@ class Trainer(object):
 
         outputs = {
             "loss": average_loss,
+            "reg": average_reg,
             "lr": self.optimizer.param_groups[0]["lr"],
         }
 
@@ -804,6 +911,7 @@ class Trainer(object):
         )
 
         total_loss = 0
+        total_reg = 0
         if self.local_rank == 0 and self.report_metric_at_train:
             for metric in self.metrics:
                 metric.clear()
@@ -836,9 +944,9 @@ class Trainer(object):
             self.optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data)
+                preds, truths, loss, reg = self.train_step(data)
 
-            self.scaler.scale(loss).backward()
+            self.scaler.scale(loss + self.model.reg_weight * reg).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
@@ -848,6 +956,9 @@ class Trainer(object):
             loss_val = loss.item()
             total_loss += loss_val
 
+            reg_val = reg.item()
+            total_reg += reg_val
+
             if self.local_rank == 0:
                 if self.report_metric_at_train:
                     for metric in self.metrics:
@@ -855,6 +966,7 @@ class Trainer(object):
 
                 if self.use_tensorboardX:
                     self.writer.add_scalar("train/loss", loss_val, self.global_step)
+                    self.writer.add_scalar("train/reg", reg_val, self.global_step)
                     self.writer.add_scalar(
                         "train/lr",
                         self.optimizer.param_groups[0]["lr"],
@@ -863,11 +975,11 @@ class Trainer(object):
 
                 if self.scheduler_update_every_step:
                     pbar.set_description(
-                        f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}"
+                        f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), reg={reg_val:.4f} ({total_reg/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}"
                     )
                 else:
                     pbar.set_description(
-                        f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})"
+                        f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), reg={reg_val:.4f} ({total_reg/self.local_step:.4f})"
                     )
                 pbar.update(loader.batch_size)
 
@@ -876,6 +988,9 @@ class Trainer(object):
 
         average_loss = total_loss / self.local_step
         self.stats["loss"].append(average_loss)
+
+        average_reg = total_reg / self.local_step
+        self.stats["reg"].append(average_reg)
 
         if self.local_rank == 0:
             pbar.close()
@@ -928,7 +1043,19 @@ class Trainer(object):
                 self.local_step += 1
 
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    preds, preds_depth, truths, loss = self.eval_step(data)
+                    (
+                        preds,
+                        preds_depth,
+                        truths,
+                        loss,
+                        lines,
+                        lines_outs,
+                    ) = self.eval_step(data)
+
+                lines_depth = lines_outs["depth"]  # [B, M * N_l]
+                lines_depth_unnorm = lines_outs["depth_unnorm"]  # [B, M * N_l]
+                xyzs_l = lines_outs["xyzs"]  # different shape for train / test
+                alphas_l = lines_outs["alphas"]  # different shape for train / test
 
                 # all_gather/reduce the statistics (NCCL only support all_*)
                 if self.world_size > 1:
@@ -956,6 +1083,41 @@ class Trainer(object):
                     dist.all_gather(truths_list, truths)
                     truths = torch.cat(truths_list, dim=0)
 
+                    lines_list = [
+                        torch.zeros_like(lines).to(self.device)
+                        for _ in range(self.world_size)
+                    ]  # [[B, ...], [B, ...], ...]
+                    dist.all_gather(lines_list, lines)
+                    lines = torch.cat(lines_list, dim=0)
+
+                    lines_depth_list = [
+                        torch.zeros_like(lines_depth).to(self.device)
+                        for _ in range(self.world_size)
+                    ]  # [[B, ...], [B, ...], ...]
+                    dist.all_gather(lines_depth_list, lines_depth)
+                    lines_depth = torch.cat(lines_depth_list, dim=0)
+
+                    lines_depth_unnorm_list = [
+                        torch.zeros_like(lines_depth_unnorm).to(self.device)
+                        for _ in range(self.world_size)
+                    ]  # [[B, ...], [B, ...], ...]
+                    dist.all_gather(lines_depth_unnorm_list, lines_depth_unnorm)
+                    lines_depth_unnorm = torch.cat(lines_depth_unnorm_list, dim=0)
+
+                    xyzs_l_list = [
+                        torch.zeros_like(xyzs_l).to(self.device)
+                        for _ in range(self.world_size)
+                    ]  # [[B, ...], [B, ...], ...]
+                    dist.all_gather(xyzs_l_list, xyzs_l)
+                    xyzs_l = torch.cat(xyzs_l_list, dim=0)
+
+                    alphas_l_list = [
+                        torch.zeros_like(alphas_l).to(self.device)
+                        for _ in range(self.world_size)
+                    ]  # [[B, ...], [B, ...], ...]
+                    dist.all_gather(alphas_l_list, alphas_l)
+                    alphas_l = torch.cat(alphas_l_list, dim=0)
+
                 loss_val = loss.item()
                 total_loss += loss_val
 
@@ -976,22 +1138,67 @@ class Trainer(object):
                         "validation",
                         f"{self.name}_{self.epoch:04d}_{self.local_step:04d}_depth.png",
                     )
+                    save_path_line_depth = os.path.join(
+                        self.workspace,
+                        "validation",
+                        f"{self.name}_{self.epoch:04d}_{self.local_step:04d}_line_depth.png",
+                    )
+                    save_path_line_pts = os.path.join(
+                        self.workspace,
+                        "validation",
+                        f"{self.name}_{self.epoch:04d}_{self.local_step:04d}_line_pts.ply",
+                    )
                     # save_path_gt = os.path.join(self.workspace, 'validation', f'{self.name}_{self.epoch:04d}_{self.local_step:04d}_gt.png')
 
                     # self.log(f"==> Saving validation image to {save_path}")
                     os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+                    img = cv2.cvtColor(
+                        (preds[0].detach().cpu().numpy() * 255).astype(np.uint8),
+                        cv2.COLOR_RGB2BGR,
+                    )
+                    for j in range(lines.shape[1]):
+                        img = cv2.line(
+                            img,
+                            lines[0, j, :2].to(torch.int32).cpu().numpy(),
+                            lines[0, j, 2:].to(torch.int32).cpu().numpy(),
+                            (255, 0, 0),
+                            2,
+                        )  # TODO: color management
                     cv2.imwrite(
-                        save_path,
-                        cv2.cvtColor(
-                            (preds[0].detach().cpu().numpy() * 255).astype(np.uint8),
-                            cv2.COLOR_RGB2BGR,
-                        ),
+                        save_path, img,
                     )
                     cv2.imwrite(
                         save_path_depth,
                         (preds_depth[0].detach().cpu().numpy() * 255).astype(np.uint8),
                     )
+
+                    verts_from_depth = (
+                        data["rays_o_l"]
+                        + data["rays_d_l"] * lines_depth_unnorm[:, None]
+                    )
+                    trimesh.PointCloud(
+                        vertices=verts_from_depth.cpu().numpy().squeeze(),
+                        # colors=cm.magma(alphas_l.cpu().numpy().squeeze()),
+                    ).export(save_path_line_pts)
+
+                    # # TODO: fix
+                    # trimesh.PointCloud(
+                    #     vertices=xyzs_l.cpu().numpy().squeeze(),
+                    #     colors=cm.magma(alphas_l.cpu().numpy().squeeze()),
+                    # ).export(save_path_line_pts)
                     # cv2.imwrite(save_path_gt, cv2.cvtColor((truths[0].detach().cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+
+                    lines_depth = lines_depth.reshape(
+                        (lines.shape[0], lines.shape[1], -1)
+                    )
+                    fig, ax = plt.subplots(1, 1)
+                    for j in range(lines.shape[1]):
+                        ax.plot(
+                            lines_depth.cpu().numpy()[0, j]
+                        )  # shape is [1, M, N_points_on_line]
+                    fig.savefig(save_path_line_depth)
+                    plt.close(fig)
 
                     pbar.set_description(
                         f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})"

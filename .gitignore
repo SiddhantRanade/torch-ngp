@@ -6,7 +6,9 @@ build/
 tmp*
 data/
 trial*/
+/workspace/
 .vs/
+*.MOV
 
 volsdf/
 **volsdf*

@@ -258,7 +258,7 @@ class NeRFRenderer(nn.Module):
             dirs.reshape(-1, 3),
             mask=mask.reshape(-1),
             **density_outputs
-        )
+        )  # type: ignore
         rgbs = rgbs.view(N, -1, 3)  # [N, T+t, 3]
 
         # print(xyzs.shape, 'valid_rgb:', mask.sum().item())
@@ -290,6 +290,11 @@ class NeRFRenderer(nn.Module):
         return {
             "depth": depth,
             "image": image,
+            "xyzs": xyzs,
+            "rgbs": rgbs,
+            "sigmas": density_outputs["sigma"],
+            "alphas": alphas,
+            "weights_sum": weights_sum,
         }
 
     def run_cuda(
@@ -349,6 +354,7 @@ class NeRFRenderer(nn.Module):
             )  # [M,], use a dict since it may include extra things, like geo_feat for rgb.
             sigmas = density_outputs["sigma"]
             sigmas = self.density_scale * sigmas
+            alphas = 1 - torch.exp(-deltas[:, 1] * sigmas.squeeze(-1))  # [N, T+t]
             rgbs = self.color(xyzs, dirs, **density_outputs)
 
             # print(f'valid RGB query ratio: {mask.sum().item() / mask.shape[0]} (total = {mask.sum().item()})')
@@ -428,7 +434,9 @@ class NeRFRenderer(nn.Module):
                 )  # [M,], use a dict since it may include extra things, like geo_feat for rgb.
                 sigmas = density_outputs["sigma"]
                 sigmas = self.density_scale * sigmas
-                rgbs = self.color(xyzs, dirs, **density_outputs)
+                rgbs = self.color(xyzs, dirs, **density_outputs)  # type: ignore
+
+                alphas = 1 - torch.exp(-deltas[:, 1] * sigmas.squeeze(-1))  # [N, T+t]
 
                 raymarching.composite_rays(
                     n_alive,
@@ -451,13 +459,38 @@ class NeRFRenderer(nn.Module):
         image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
         image = image.view(*prefix, 3)
 
+        depth_unnorm = depth
+
         depth = torch.clamp(depth - nears, min=0) / (fars - nears)
         depth = depth.view(*prefix)
 
         return {
             "depth": depth,
+            "depth_unnorm": depth_unnorm,
             "image": image,
+            "xyzs": xyzs,  # type: ignore
+            "rgbs": rgbs,  # type: ignore
+            "sigmas": sigmas,  # type: ignore
+            "alphas": alphas,  # type: ignore
+            "weights_sum": weights_sum,
+            "rays": rays if self.training else None,  # type: ignore
         }
+        # if self.training:
+        #     return {
+        #         "depth": depth,
+        #         "image": image,
+        #         "xyzs": xyzs,  # type: ignore
+        #         "rgbs": rgbs,  # type: ignore
+        #         "sigmas": sigmas,  # type: ignore
+        #         "alphas": alphas,  # type: ignore
+        #         "weights_sum": weights_sum,
+        #         "rays": rays,  # type: ignore
+        #     }
+        # else:
+        #     return {
+        #         "depth": depth,
+        #         "image": image,
+        #     }
 
     @torch.no_grad()
     def mark_untrained_grid(self, poses, intrinsic, S=64):
